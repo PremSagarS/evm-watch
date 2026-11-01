@@ -1,0 +1,39 @@
+name: EVM MUV price watch
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours (UTC), at :17 to dodge the top-of-hour queue
+  workflow_dispatch:          # "Run workflow" button for manual runs
+
+concurrency:
+  group: evm-watch            # never two runs at once (would race on ALL_TIME_LOW)
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check prices
+        id: watch
+        run: python evm_watch.py
+        env:
+          ALL_TIME_LOW: ${{ vars.ALL_TIME_LOW }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+
+      - name: Save new all-time low
+        if: steps.watch.outputs.new_low != ''
+        run: gh variable set ALL_TIME_LOW --body "$NEW_LOW" --repo "$GITHUB_REPOSITORY"
+        env:
+          NEW_LOW: ${{ steps.watch.outputs.new_low }}
+          GH_TOKEN: ${{ secrets.VARS_PAT }}   # GITHUB_TOKEN can't write repo variables
