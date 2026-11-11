@@ -3,7 +3,13 @@ name: EVM MUV price watch
 on:
   schedule:
     - cron: "17 */6 * * *"   # every 6 hours (UTC), at :17 to dodge the top-of-hour queue
+    - cron: "17 3 * * *"     # daily summary, 08:47 IST
   workflow_dispatch:          # "Run workflow" button for manual runs
+    inputs:
+      daily:
+        description: "Send the daily summary"
+        type: boolean
+        default: false
 
 concurrency:
   group: evm-watch            # never two runs at once (would race on ALL_TIME_LOW)
@@ -25,15 +31,35 @@ jobs:
 
       - name: Check prices
         id: watch
-        run: python evm_watch.py
+        timeout-minutes: 12        # fail the step (not cancel the job) so the alert step still runs
+        run: |
+          if [ "$SCHEDULE" = "17 3 * * *" ] || [ "$DAILY_INPUT" = "true" ]; then
+            python evm_watch.py --daily
+          else
+            python evm_watch.py
+          fi
         env:
+          SCHEDULE: ${{ github.event.schedule }}
+          DAILY_INPUT: ${{ inputs.daily }}
           ALL_TIME_LOW: ${{ vars.ALL_TIME_LOW }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
 
       - name: Save new all-time low
-        if: steps.watch.outputs.new_low != ''
+        if: always() && steps.watch.outputs.new_low != ''
         run: gh variable set ALL_TIME_LOW --body "$NEW_LOW" --repo "$GITHUB_REPOSITORY"
         env:
           NEW_LOW: ${{ steps.watch.outputs.new_low }}
           GH_TOKEN: ${{ secrets.VARS_PAT }}   # GITHUB_TOKEN can't write repo variables
+
+      - name: Alert if anything in this job failed
+        if: failure()
+        run: |
+          for id in ${TELEGRAM_CHAT_IDS//,/ }; do
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="$id" -d text="⚠️ EVM watcher workflow failed: $RUN_URL"
+          done
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
