@@ -1,5 +1,6 @@
 """
-evm_watch.py - ping Telegram when an EVM Wheels MUV hits a new all-time low price.
+evm_watch.py - ping Telegram when an EVM Wheels MUV hits a new all-time low price,
+plus a daily "still alive" summary so a silent failure can't go unnoticed.
 
 Built for GitHub Actions. All state is ONE integer: the repository variable
 ALL_TIME_LOW (the cheapest MUV total ever seen, in rupees). The script reads it
@@ -16,7 +17,13 @@ Environment:
   TELEGRAM_BOT_TOKEN   bot token from @BotFather
   TELEGRAM_CHAT_IDS    comma-separated chat ids, e.g. "5612988574,7239632899"
 
-Local test:  python evm_watch.py --from-file saved_response.txt --dry-run
+Flags:
+  --daily        always send a summary (run once a day from a separate cron)
+  --dry-run      print alerts instead of sending them
+  --from-file F  parse a saved response instead of fetching
+  --test-notify  send a test Telegram message and exit
+
+Local test:  python evm_watch.py --from-file saved_response.txt --dry-run --daily
 """
 
 import argparse
@@ -107,6 +114,11 @@ def _num(t):
     return int(digits) if digits else None
 
 
+def rs(n) -> str:
+    """Format rupees; safe for None."""
+    return "-" if n is None else f"₹{n:,}"
+
+
 def parse_cars(page: str) -> list:
     soup = BeautifulSoup(page, "lxml")
     cars = []
@@ -162,6 +174,65 @@ def save_low(value: int):
     print(f"new_low={value}")
 
 
+def run(a):
+    trip = f"{PICKUP:%d %b %H:%M} to {DROP:%d %b %H:%M}"
+
+    if dt.datetime.now(IST).replace(tzinfo=None) >= PICKUP:
+        msg = "Pickup time has passed; nothing to watch. Disable the workflow."
+        print(msg)
+        if a.daily:
+            notify("EVM watcher: trip has started", msg, "🛑", a.dry_run)
+        return
+
+    raw_prev = os.environ.get("ALL_TIME_LOW", "").strip()
+    prev = int(raw_prev) if raw_prev.isdigit() else None
+
+    page = (response_to_html(Path(a.from_file).read_text(encoding="utf-8"))
+            if a.from_file else fetch_cards_html())
+    cars = parse_cars(page)
+    if not cars:
+        raise RuntimeError("0 cars parsed; the site's layout or flow may have changed")
+
+    watched = [c for c in cars if not WATCH_CATEGORIES or c["category"] in WATCH_CATEGORIES]
+    priced = sorted((c for c in watched if c["total"] is not None), key=lambda c: c["total"])
+    cheapest = priced[0] if priced else None
+
+    now_str = "-" if not cheapest else f"{rs(cheapest['total'])} ({cheapest['model']})"
+    print(f"{len(cars)} cars, {len(watched)} watched, {len(priced)} priced; "
+          f"cheapest now {now_str}; all-time low {rs(prev)}")
+
+    if cheapest and prev is None:
+        save_low(cheapest["total"])
+        notify("EVM watcher started",
+               f"Watching MUVs for {trip}.\nStarting low: {rs(cheapest['total'])} "
+               f"({cheapest['brand']} {cheapest['model']}). I'll ping you when it goes lower, "
+               f"plus a daily summary.",
+               "✅", a.dry_run)
+
+    elif cheapest and cheapest["total"] < prev:
+        save_low(cheapest["total"])
+        per_day = f", {rs(cheapest['per_day'])}/day" if cheapest["per_day"] else ""
+        body = (f"{cheapest['brand']} {cheapest['model']}\n"
+                f"{rs(cheapest['total'])} total{per_day}\n"
+                f"Previous low {rs(prev)}, down {rs(prev - cheapest['total'])}\n{trip}")
+        print("NEW LOW:", body.replace("\n", " | "))
+        notify(f"New all-time low: {rs(cheapest['total'])}", body, "📉", a.dry_run)
+
+    elif a.daily:
+        if cheapest:
+            body = (f"Cheapest MUV now: {rs(cheapest['total'])} "
+                    f"({cheapest['brand']} {cheapest['model']})\n"
+                    f"All-time low: {rs(prev)}\n"
+                    f"{len(priced)} MUVs available\n{trip}")
+        else:
+            body = (f"No MUV available right now (all sold out).\n"
+                    f"All-time low: {rs(prev)}\n{trip}")
+        notify("Daily check: watcher is running", body, "🟢", a.dry_run)
+
+    elif not cheapest:
+        print("No watched car has a price right now (all sold out).")
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):   # don't crash printing ₹ on non-UTF-8 consoles
         try:
@@ -173,57 +244,19 @@ def main():
     ap.add_argument("--from-file", help="parse a saved response instead of fetching (testing)")
     ap.add_argument("--dry-run", action="store_true", help="print alerts instead of sending them")
     ap.add_argument("--test-notify", action="store_true", help="send a test Telegram message and exit")
+    ap.add_argument("--daily", action="store_true", help="always send a summary message")
     a = ap.parse_args()
 
     if a.test_notify:
         notify("EVM watcher test", "If you can read this, alerts work.")
         return
 
-    if dt.datetime.now(IST).replace(tzinfo=None) >= PICKUP:
-        print("Pickup time has passed; nothing to watch. Disable the workflow.")
-        return
-
-    raw_prev = os.environ.get("ALL_TIME_LOW", "").strip()
-    prev = int(raw_prev) if raw_prev.isdigit() else None
-
     try:
-        page = (response_to_html(Path(a.from_file).read_text(encoding="utf-8"))
-                if a.from_file else fetch_cards_html())
-        cars = parse_cars(page)
-        if not cars:
-            raise RuntimeError("0 cars parsed; the site's layout or flow may have changed")
-    except Exception as e:
-        print(f"Check failed: {e}", file=sys.stderr)
+        run(a)
+    except Exception as e:   # anything at all: network, parsing, formatting bugs
+        print(f"Check failed: {type(e).__name__}: {e}", file=sys.stderr)
         notify("EVM watcher failed", f"{type(e).__name__}: {str(e)[:300]}", "⚠️", a.dry_run)
         sys.exit(1)   # marks the Actions run as failed, so it's visible there too
-
-    watched = [c for c in cars if not WATCH_CATEGORIES or c["category"] in WATCH_CATEGORIES]
-    priced = sorted((c for c in watched if c["total"] is not None), key=lambda c: c["total"])
-    cheapest = priced[0] if priced else None
-
-    now_str = "-" if not cheapest else "₹{:,} ({})".format(cheapest["total"], cheapest["model"])
-    low_str = "-" if prev is None else "₹{:,}".format(prev)
-    print(f"{len(cars)} cars, {len(watched)} watched, {len(priced)} priced; "
-          f"cheapest now {now_str}; all-time low {low_str}")
-
-    if not cheapest:
-        print("No watched car has a price right now (all sold out).")
-        return
-
-    trip = f"{PICKUP:%d %b %H:%M} to {DROP:%d %b %H:%M}"
-    if prev is None:
-        save_low(cheapest["total"])
-        notify("EVM watcher started",
-               f"Watching MUVs for {trip}.\nStarting low: ₹{cheapest['total']:,} "
-               f"({cheapest['brand']} {cheapest['model']}). I'll ping you when it goes lower.",
-               "✅", a.dry_run)
-    elif cheapest["total"] < prev:
-        save_low(cheapest["total"])
-        body = (f"{cheapest['brand']} {cheapest['model']}\n"
-                f"₹{cheapest['total']:,} total, ₹{cheapest['per_day']:,}/day\n"
-                f"Previous low ₹{prev:,}, down ₹{prev - cheapest['total']:,}\n{trip}")
-        print("NEW LOW:", body.replace("\n", " | "))
-        notify(f"New all-time low: ₹{cheapest['total']:,}", body, "📉", a.dry_run)
 
 
 if __name__ == "__main__":
