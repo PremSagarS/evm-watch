@@ -39,7 +39,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------- config ---
-PICKUP = dt.datetime(2026, 12, 20, 9, 0)   # pickup date and time (IST)
+PICKUP = dt.datetime(2026, 12, 20, 12, 0)  # pickup date and time (IST)
 DROP = dt.datetime(2026, 12, 22, 12, 0)    # drop date and time (IST)
 CITY_ID = 5
 HUB_ID = 41
